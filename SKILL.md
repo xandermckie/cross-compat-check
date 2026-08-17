@@ -79,12 +79,30 @@ For each finding:
    check-and-fallback rewrite pattern (see compat-rules.md rule 4) rather than just deleting the
    reference -- that usually preserves the skill's actual capability on the product where the
    tool does exist, instead of losing it everywhere.
-4. **Ask before applying.** A yes/no/"let me tweak it" is enough -- you don't need a full
-   AskUserQuestion multi-choice UI for every single line, plain conversational back-and-forth
-   works fine here, and is what makes this feel like a review rather than a form. If the user
-   says yes, apply it with Edit immediately rather than batching edits for later -- that way if
-   something looks wrong after the edit, it's easy to spot before you've moved three findings
-   further on.
+4. **Ask before applying, one finding per question.** If the `AskUserQuestion` tool is available
+   in this environment (it is in Cowork; it isn't in Claude Code), use it for this step -- a
+   structured multiple-choice pop-up is a better fit for a long walkthrough than free text, and
+   it's the same mechanism `grill-me` uses. Ask about exactly one finding per call: put the
+   finding and its risk in the `question` text, and give 2-3 concrete options -- typically
+   "Apply fix: <the specific rewrite>" as the recommended option, "Skip -- this is intentional"
+   as the other, and a third option only when there's a genuinely different second fix worth
+   offering (e.g. "Remove the field" vs. "Keep it and document as Claude-Code-only via
+   `compatibility`"). `AskUserQuestion` always adds its own free-text option, so don't add an
+   "Other" option yourself. Don't batch multiple findings into one call just because the tool
+   technically accepts several questions at once -- the point is a sequential walkthrough the
+   user can follow, not a form to fill out all at once.
+
+   If `AskUserQuestion` isn't available, fall back to a plain conversational yes/no/"let me
+   tweak it" question instead -- same one-at-a-time structure, just as normal text. This is
+   worth noticing explicitly: it's the same check-and-fallback pattern rule 4 in
+   `compat-rules.md` recommends for every tool reference you'll find in *other* people's skills.
+   This skill's own walkthrough step has exactly the kind of environment-dependent tool
+   reference it exists to catch -- so it practices what it checks, rather than assuming Cowork
+   and hardcoding `AskUserQuestion` outright.
+
+   Either way, once the user answers, apply the change with Edit immediately rather than
+   batching edits for later -- that way if something looks wrong after the edit, it's easy to
+   spot before you've moved three findings further on.
 
 A few callibration notes so you don't over- or under-call things:
 
