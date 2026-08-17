@@ -1,0 +1,23 @@
+{
+  "skill_name": "cross-compat-check",
+  "evals": [
+    {
+      "id": 1,
+      "prompt": "I wrote a skill called release-notes-drafter (it's at /home/claude/fixtures/bad-skill) and I want to check it into GitHub for my team to use from both Claude Code and Cowork. Can you check it for anything that would break or behave differently between the two before I push it? Walk me through what you find -- I don't have any experience with this, so explain why things are a problem, not just what to change. Since I'm not available to answer follow-up questions right now, assume I approve every fix you'd reasonably recommend, apply them, and give me a final summary of everything you changed and why.",
+      "expected_output": "Should run the scanner against /home/claude/fixtures/bad-skill, walk through each finding (frontmatter fields argument-hint/disable-model-invocation/model, the !`git log` shell injection, ${CLAUDE_PROJECT_DIR} and ${CLAUDE_SKILL_DIR} substitutions, the 'Task tool' subagent-name trap, AskUserQuestion reference, hardcoded /Users/alice/... path, 'outputs directory' phrasing, and the unguarded env var read in scripts/format.py), explain the risk for each in plain terms, apply fixes, add/update a compatibility field if warranted, and end with a summary. A final re-scan should show the fixed findings gone.",
+      "files": []
+    },
+    {
+      "id": 2,
+      "prompt": "Before I share this on GitHub, can you double check my skill for cross-platform issues? It's the release-notes-drafter skill at /home/claude/fixtures/good-skill.",
+      "expected_output": "Should run the scanner, get zero findings, and say plainly that the skill looks portable already rather than inventing issues to justify the check. Should not modify any files.",
+      "files": []
+    },
+    {
+      "id": 3,
+      "prompt": "Can you run a compatibility check on my skill before I check it in? It's at /home/claude/fixtures/cowork-only-skill -- it's a desktop file organizer that uses the remote-devices bridge and AskUserQuestion. I know it's Cowork-only, that's intentional, I just want to make sure I haven't accidentally left in anything broken or that I'm not missing anything I should document.",
+      "expected_output": "Should run the scanner, recognize the AskUserQuestion / device-bridge references are intentional (matches the user's stated intent and the skill's own compatibility field already documents the Cowork-only requirement), not push unnecessary rewrites to make it 'portable', and instead confirm the compatibility field accurately reflects the limitation. Should surface any other real finding (if any) but not manufacture busywork.",
+      "files": []
+    }
+  ]
+}

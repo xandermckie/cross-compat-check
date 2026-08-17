@@ -1,0 +1,123 @@
+---
+name: cross-compat-check
+description: >
+  Audits a skill you've authored for places where it would behave differently -- or silently
+  break -- depending on whether it runs in Claude Code or in Cowork, before you check it into
+  GitHub to share. Detects Claude Code-only frontmatter fields that hard-error on claude.ai
+  upload, shell-injection and ${CLAUDE_*} substitution syntax that goes inert outside Claude
+  Code, references to tools that only exist on one product (AskUserQuestion, SendUserFile,
+  TaskCreate/TaskUpdate, the device bridge, hooks, TodoWrite, etc.), hardcoded paths, and
+  Cowork-only filesystem assumptions like an "outputs directory". Walks through each finding
+  one at a time -- explaining the risk and a concrete fix -- and applies the fixes you approve.
+  Use this whenever the user wants to check a skill for cross-compatibility, portability, or
+  "does this work in both Claude Code and Cowork", before publishing, sharing, or pushing a
+  skill to GitHub, or when they mention a skill breaking on one product but not the other.
+license: MIT
+compatibility: Runs the bundled scan_skill.py with Python 3 (no external dependencies) and edits
+  files with Edit -- works in both Claude Code and Cowork.
+---
+
+# cross-compat-check
+
+You're auditing a skill someone else will `git clone` and use from either Claude Code (reading
+straight off disk) or Cowork (which never reads local skill files directly -- it only sees a
+skill via a claude.ai account upload, or as part of a full plugin install). Those are two
+different loading paths with different rules, and a skill that looks fine in one can quietly
+misbehave, or outright fail to package, in the other. Your job is to find every place that's
+true and help fix it -- not to lint the skill for general quality.
+
+Read `references/compat-rules.md` before your first walkthrough of a real skill -- it has the
+full reasoning behind every rule the scanner checks, including which findings are hard facts
+(documented, mechanical) versus which are heuristics worth a second look. You'll need that
+context to explain findings well, since the point of this skill is teaching the user *why*
+something breaks, not just handing them a checklist.
+
+## Step 1: Figure out what you're scanning
+
+Ask the user (if it isn't already obvious from context) which skill or plugin directory to
+check. If they haven't told you the intended distribution path -- a standalone skill others will
+add individually, or part of a plugin -- ask, since it changes how strictly rule 3 (the
+`${CLAUDE_PLUGIN_ROOT}` substitution) applies. Don't ask more than you need to get started;
+you'll surface anything else that matters as findings.
+
+## Step 2: Run the scanner
+
+```bash
+python3 ${CLAUDE_SKILL_DIR}/scripts/scan_skill.py <path-to-skill-or-SKILL.md> --json
+```
+
+If `${CLAUDE_SKILL_DIR}` doesn't resolve (e.g. you're running this skill's own body outside
+Claude Code), locate `scan_skill.py` relative to wherever this skill's files actually live and
+run it directly with that path instead.
+
+This gives you a structured list of findings, each with a `confidence` (`confirmed` or
+`heuristic`), `category`, file/line, a `risk` explanation, and a suggested `fix`. Read
+`compat-rules.md` alongside the raw findings -- the script tells you *what* it found, the
+reference doc tells you *why it matters* and gives you the fuller fix pattern to propose (the
+scanner's `fix` field is a short version; the doc has the reasoning and, for tool-reference
+findings, the general "check-and-fallback" rewrite pattern worth teaching, not just applying).
+
+If the scan comes back with zero findings, say so plainly and skip straight to Step 4 -- don't
+manufacture things to ask about.
+
+## Step 3: Walk through findings one at a time (grill-me style)
+
+Don't dump the whole findings list and ask "which do you want fixed." Go one at a time, in this
+order: `confirmed` findings first (these are mechanical facts, not judgment calls), then
+`heuristic` findings grouped by file so related ones are easy to compare.
+
+For each finding:
+
+1. **Show the snippet in context** -- enough surrounding text that the user recognizes what
+   you're pointing at without having to go open the file themselves.
+2. **Explain the risk in plain terms** -- what actually happens differently on the other
+   product, not just "this field isn't allowed." If you know *why* (from compat-rules.md), say
+   why -- that's the teaching part of this skill, and it's what makes the user better at writing
+   portable skills next time instead of just fixing this one.
+3. **Propose a specific fix** -- not "consider rewriting this," but the actual replacement text
+   or frontmatter change you'd make. For tool-reference findings, default to proposing the
+   check-and-fallback rewrite pattern (see compat-rules.md rule 4) rather than just deleting the
+   reference -- that usually preserves the skill's actual capability on the product where the
+   tool does exist, instead of losing it everywhere.
+4. **Ask before applying.** A yes/no/"let me tweak it" is enough -- you don't need a full
+   AskUserQuestion multi-choice UI for every single line, plain conversational back-and-forth
+   works fine here, and is what makes this feel like a review rather than a form. If the user
+   says yes, apply it with Edit immediately rather than batching edits for later -- that way if
+   something looks wrong after the edit, it's easy to spot before you've moved three findings
+   further on.
+
+A few callibration notes so you don't over- or under-call things:
+
+- Heuristic tool-reference findings for a tool the skill is *obviously* meant to use on purpose
+  (e.g. a Cowork-only plugin-creation skill that legitimately uses `AskUserQuestion` throughout,
+  because it's only ever meant to run in Cowork) aren't bugs. Say so, and skip them quickly --
+  don't push a fallback rewrite onto a skill that was never meant to be portable in the first
+  place. This is exactly the kind of judgment call the scanner can't make and you can.
+- If several findings are really the same root cause (e.g. five separate `${CLAUDE_PROJECT_DIR}`
+  hits because the skill leans on it throughout), say that up front and offer to fix the pattern
+  once rather than making the user say "yes" five times for what's really one decision.
+- If a finding truly can't be fixed without losing the skill's actual purpose (rule 7 in
+  compat-rules.md), don't force a rewrite -- propose adding or updating the `compatibility`
+  frontmatter field instead, so the limitation is documented rather than discovered by a
+  confused user later.
+
+## Step 4: Re-scan and summarize
+
+After applying fixes, run the scanner again to confirm the fixed findings are actually gone and
+nothing new got introduced. Then give a short summary: what was fixed, what was intentionally
+left as-is (and why -- e.g. "this skill is Cowork-only by design"), and whether the
+`compatibility` field accurately reflects any remaining limitation. This is the point where it's
+reasonable to tell the user the skill is ready to check into GitHub -- don't say that earlier.
+
+## Notes on the scanner itself
+
+- It's intentionally conservative about false negatives over false positives: it flags anything
+  matching a known-risky pattern, even when it's probably fine, because a human skimming ten
+  findings and dismissing two is cheaper than a human never being shown the one that mattered.
+  Don't apologize for or downplay findings that turn out to be non-issues -- just say so and
+  move on.
+- The tool-name lists in `compat-rules.md` (and mirrored in `scan_skill.py`) are a best-effort
+  snapshot, not a guaranteed-current spec. If you're ever unsure whether something is genuinely
+  Cowork-only or Claude-Code-only, say that uncertainty out loud rather than asserting it as
+  fact -- and if you learn a tool's availability has changed, that's worth updating in
+  `compat-rules.md` for next time.
