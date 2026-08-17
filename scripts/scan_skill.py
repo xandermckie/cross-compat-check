@@ -93,17 +93,38 @@ DELIVERY_PHRASES = [
 
 # --- Rule 6: env vars ---------------------------------------------------------------------------
 
+# Python and JS/TS read patterns. Order matters only in that each must capture the var name in
+# group(1); os.environ.get() and os.getenv() are at least as common as the bracket/attribute
+# forms below and were missed entirely before this list grew to cover them.
 ENV_VAR_PATTERNS = [
     re.compile(r"os\.environ\[[\'\"]([A-Z_][A-Z0-9_]*)[\'\"]\]"),
+    re.compile(r"os\.environ\.get\([\'\"]([A-Z_][A-Z0-9_]*)[\'\"]"),
+    re.compile(r"os\.getenv\([\'\"]([A-Z_][A-Z0-9_]*)[\'\"]"),
     re.compile(r"process\.env\.([A-Z_][A-Z0-9_]*)"),
+    re.compile(r"process\.env\[[\'\"]([A-Z_][A-Z0-9_]*)[\'\"]\]"),
 ]
 
-PLATFORM_PROVIDED_ENV = {"CLAUDE_PROJECT_DIR", "CLAUDE_SESSION_ID", "CLAUDE_PLUGIN_ROOT", "CLAUDE_PLUGIN_DATA", "PATH", "HOME"}
+# Bash/shell var reads ($VAR or ${VAR}), scanned separately since shell scripts don't match the
+# Python/JS patterns above at all -- a bundled .sh script reading a secret was previously
+# invisible to this scanner regardless of confidence level.
+SHELL_ENV_VAR_PATTERN = re.compile(r"\$\{?([A-Z_][A-Z0-9_]*)\}?")
+
+PLATFORM_PROVIDED_ENV = {
+    "CLAUDE_PROJECT_DIR", "CLAUDE_SESSION_ID", "CLAUDE_PLUGIN_ROOT", "CLAUDE_PLUGIN_DATA",
+    "CLAUDE_SKILL_DIR",
+    # common shell/OS-provided vars -- flagging these in a bundled .sh script would be noise,
+    # not a real portability finding, since every shell environment sets them.
+    "PATH", "HOME", "USER", "PWD", "OLDPWD", "SHELL", "LANG", "LC_ALL", "TERM", "TMPDIR", "TMP",
+    "TEMP", "HOSTNAME", "SHLVL", "IFS", "PS1", "PS2",
+}
 
 
 def parse_frontmatter(text):
-    """Minimal, dependency-free frontmatter parser. Good enough for flat key: value pairs;
-    doesn't need to fully understand YAML since we only care about top-level key names."""
+    """Minimal, dependency-free frontmatter parser. Good enough for flat key: value pairs and
+    folded multi-line scalars (the `key: >` / plain-continuation style used throughout this
+    skill's own SKILL.md); doesn't need to fully understand YAML since callers only need the set
+    of top-level key names and, for a few fields like `compatibility`, the full text content --
+    not list/nested-map structure."""
     if not text.startswith("---"):
         return {}, text
     parts = text.split("---", 2)
@@ -122,8 +143,12 @@ def parse_frontmatter(text):
             if key:
                 fields[key] = val.strip()
                 current_key = key
-        # indented continuation lines (multi-line strings, list items) are ignored for key
-        # detection purposes -- we only need the set of top-level keys present.
+        elif current_key is not None:
+            # Indented continuation line -- fold it onto the current key's value with a space,
+            # same as YAML's folded-scalar (`>`) style. This only matters for reading a field's
+            # *text* (e.g. checking whether `compatibility` mentions something); the set of
+            # top-level keys detected above is unaffected either way.
+            fields[current_key] = (fields[current_key] + " " + raw_line.strip()).strip()
     return fields, body
 
 
@@ -261,10 +286,18 @@ def scan_skill_md(path: Path):
                 "fix": "Describe the outcome ('make sure the user ends up with file X') and let the body branch on what's actually available rather than assuming one delivery mechanism.",
             })
 
+    # Rule 6/7 combined: an env var read only stays a "go fix this" finding if the skill hasn't
+    # already documented it. Rule 7's actual fix for an env var IS the compatibility field -- so
+    # once that field mentions the variable by name, the finding has already been acted on and
+    # re-flagging it is just noise. Check case-insensitively since frontmatter authors won't
+    # necessarily match the variable's exact casing in prose.
+    compat_text = fields.get("compatibility", "")
     for pat in ENV_VAR_PATTERNS:
         for m in pat.finditer(text):
             var = m.group(1)
             if var in PLATFORM_PROVIDED_ENV:
+                continue
+            if var.lower() in compat_text.lower():
                 continue
             findings.append({
                 "id": f"env-var-{var}-{m.start()}",
@@ -276,20 +309,6 @@ def scan_skill_md(path: Path):
                 "risk": f"Reads env var {var}, which isn't obviously platform-provided. Cowork's sandbox starts clean aside from what the platform sets.",
                 "fix": "Document the required env var explicitly (README or the `compatibility` field) rather than assuming it's set.",
             })
-
-    # Rule 7: compatibility field present when risky features exist
-    risky_categories = {f["category"] for f in findings if f["confidence"] == "confirmed"}
-    if risky_categories and "compatibility" not in fields:
-        findings.append({
-            "id": "missing-compatibility-field",
-            "confidence": "heuristic",
-            "category": "documentation",
-            "file": str(path),
-            "line": 1,
-            "snippet": "(no compatibility field in frontmatter)",
-            "risk": "This skill has confirmed cross-compat issues but no `compatibility` field documenting environment requirements.",
-            "fix": 'Once the fixable issues above are resolved, if anything genuinely can\'t be made portable, add e.g. `compatibility: Requires Claude Code; not usable from Cowork.` so the limitation is explicit rather than discovered by trial and error.',
-        })
 
     return findings
 
@@ -377,29 +396,48 @@ def main():
 
     findings = scan_skill_md(skill_md) + scan_plugin_context(skill_dir)
 
+    # Re-parse frontmatter once here (cheap) so the bundled-script env-var pass below can apply
+    # the same "already documented in `compatibility`" suppression that scan_skill_md() applies
+    # to env vars read directly in the SKILL.md body -- a script's env var deserves the same
+    # courtesy once it's been documented, not a permanent re-flag.
+    skill_text = skill_md.read_text(encoding="utf-8", errors="replace")
+    skill_fields, _ = parse_frontmatter(skill_text)
+    compat_text = skill_fields.get("compatibility", "")
+
     # also scan any bundled scripts for shell-injection-style patterns is out of scope --
     # scripts are executed, not preprocessed, so the injection/substitution rules don't apply
     # to them. Bundled scripts are still worth an env-var pass though.
     scripts_dir = skill_dir / "scripts"
     if scripts_dir.exists():
         for script_file in scripts_dir.rglob("*"):
-            if script_file.is_file() and script_file.suffix in (".py", ".sh", ".js", ".ts"):
-                script_text = script_file.read_text(encoding="utf-8", errors="replace")
-                for pat in ENV_VAR_PATTERNS:
-                    for m in pat.finditer(script_text):
-                        var = m.group(1)
-                        if var in PLATFORM_PROVIDED_ENV:
-                            continue
-                        findings.append({
-                            "id": f"script-env-var-{script_file.name}-{var}-{m.start()}",
-                            "confidence": "heuristic",
-                            "category": "environment",
-                            "file": str(script_file),
-                            "line": line_number_for(script_text, m.start()),
-                            "snippet": m.group(0),
-                            "risk": f"Bundled script reads env var {var}, which isn't obviously platform-provided.",
-                            "fix": "Document the required env var explicitly (README or the `compatibility` field).",
-                        })
+            if not script_file.is_file():
+                continue
+            # Shell scripts read env vars as $VAR / ${VAR} -- a different syntax entirely from
+            # the Python/JS accessor patterns, so they need their own pattern, not a shared one.
+            if script_file.suffix == ".sh":
+                patterns = [SHELL_ENV_VAR_PATTERN]
+            elif script_file.suffix in (".py", ".js", ".ts"):
+                patterns = ENV_VAR_PATTERNS
+            else:
+                continue
+            script_text = script_file.read_text(encoding="utf-8", errors="replace")
+            for pat in patterns:
+                for m in pat.finditer(script_text):
+                    var = m.group(1)
+                    if var in PLATFORM_PROVIDED_ENV or var.startswith("CLAUDE_"):
+                        continue
+                    if var.lower() in compat_text.lower():
+                        continue
+                    findings.append({
+                        "id": f"script-env-var-{script_file.name}-{var}-{m.start()}",
+                        "confidence": "heuristic",
+                        "category": "environment",
+                        "file": str(script_file),
+                        "line": line_number_for(script_text, m.start()),
+                        "snippet": m.group(0),
+                        "risk": f"Bundled script reads env var {var}, which isn't obviously platform-provided.",
+                        "fix": "Document the required env var explicitly (README or the `compatibility` field).",
+                    })
                 for pat in ABS_PATH_PATTERNS:
                     for m in pat.finditer(script_text):
                         findings.append({

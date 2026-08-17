@@ -135,7 +135,8 @@ reasonable to tell the user the skill is ready to check into GitHub -- don't say
   Don't apologize for or downplay findings that turn out to be non-issues -- just say so and
   move on.
 - The tool-name lists in `compat-rules.md` (and mirrored in `scan_skill.py`) are a best-effort
-  snapshot, not a guaranteed-current spec. If you're ever unsure whether something is genuinely
+  snapshot, not a guaranteed-current spec -- `compat-rules.md` carries a "last verified" date at
+  the top for exactly this reason. If you're ever unsure whether something is genuinely
   Cowork-only or Claude-Code-only, say that uncertainty out loud rather than asserting it as
-  fact -- and if you learn a tool's availability has changed, that's worth updating in
-  `compat-rules.md` for next time.
+  fact -- and if you learn a tool's availability has changed, that's worth updating both the
+  list and that date in `compat-rules.md` for next time.

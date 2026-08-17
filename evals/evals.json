@@ -18,6 +18,12 @@
       "prompt": "Can you run a compatibility check on my skill before I check it in? It's at /home/claude/fixtures/cowork-only-skill -- it's a desktop file organizer that uses the remote-devices bridge and AskUserQuestion. I know it's Cowork-only, that's intentional, I just want to make sure I haven't accidentally left in anything broken or that I'm not missing anything I should document.",
       "expected_output": "Should run the scanner, recognize the AskUserQuestion / device-bridge references are intentional (matches the user's stated intent and the skill's own compatibility field already documents the Cowork-only requirement), not push unnecessary rewrites to make it 'portable', and instead confirm the compatibility field accurately reflects the limitation. Should surface any other real finding (if any) but not manufacture busywork.",
       "files": []
+    },
+    {
+      "id": 4,
+      "prompt": "Can you check my plugin's skill for cross-compatibility before I ship it? The skill is at /home/claude/fixtures/plugin-fixture/skills/sync-data -- it's part of a bigger plugin (there's a hooks/ and agents/ folder alongside the skills/ folder). It syncs data using an API token and a deploy secret it reads from the environment.",
+      "expected_output": "Should run the scanner, correctly walk through the plugin-level findings (hooks/hooks.json present -- verify it works in Cowork; agents/ present -- same; and the hardcoded /home/xander/... path inside hooks/hooks.json, which should be flagged as confirmed and fixed to use ${CLAUDE_PLUGIN_ROOT} instead). Should also flag the undocumented DEPLOY_SECRET env var (read via both os.getenv() in sync.py and $DEPLOY_SECRET in sync.sh) but should NOT flag SYNC_API_TOKEN, since that one is already documented in the skill's own compatibility field -- this is the key behavior being tested. Should not flag $HOME in sync.sh.",
+      "files": []
     }
   ]
 }

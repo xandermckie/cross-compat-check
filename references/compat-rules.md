@@ -1,5 +1,15 @@
 # Cross-compatibility rule catalog
 
+**Tool inventory and frontmatter-spec facts last verified: 2026-08-17**, against Claude Code's
+published skills documentation and this session's own Cowork tool listing. The frontmatter
+6-field spec and dynamic-injection behavior (rules 1-3) come from Claude Code's docs directly and
+should stay accurate as long as that page's URL structure doesn't change; the tool-name lists in
+rule 4 are a snapshot of two products that both ship updates regularly, so they're the part most
+likely to drift. If you're reading this more than a few months after the date above, or a
+tool-reference finding doesn't feel right, don't trust the list blindly -- spot-check the tool
+against the current session's own tool listing (for Cowork-side tools) or current Claude Code
+docs (for Claude-Code-side ones), and update this file's date when you do.
+
 This is the source of truth `scan_skill.py` codes against, and what you explain to the user
 when walking through findings. Every rule below is grounded in one of two places:
 
@@ -185,12 +195,22 @@ and let the body branch on what's actually available rather than assuming one de
 
 ## 6. Environment variables and credentials (Heuristic)
 
-References to specific env vars (`os.environ[...]`, `process.env.X`, bare `$MY_VAR` in a bundled
-script) that aren't things the skill itself defines are a portability risk: Cowork's sandbox
-starts clean aside from what the platform sets, and inherited shell environment in Claude Code
-varies by user. Flag any env var read that isn't obviously platform-provided, and recommend
-documenting required env vars explicitly (a README, or the `compatibility` field) rather than
-assuming they're set.
+References to specific env vars -- `os.environ[...]`, `os.environ.get(...)`, `os.getenv(...)`,
+`process.env.X`/`process.env['X']` in Python/JS, or bare `$VAR`/`${VAR}` reads in a bundled
+`.sh` script -- that aren't things the skill itself defines are a portability risk: Cowork's
+sandbox starts clean aside from what the platform sets, and inherited shell environment in
+Claude Code varies by user. Flag any env var read that isn't obviously platform-provided (a
+short allowlist of genuinely universal shell/OS vars like `PATH`, `HOME`, `TMPDIR` is exempt),
+and recommend documenting required env vars explicitly (a README, or the `compatibility` field)
+rather than assuming they're set.
+
+This is the one rule where the fix and the "did they already fix it" check are the same field:
+once a skill's `compatibility` text mentions a flagged variable by name, the scanner stops
+re-flagging it. Don't propose adding a `compatibility` note for something it already says --
+check the field's actual text (folded across its continuation lines, not just the first line)
+before recommending this fix. This only applies to env-var findings; a confirmed frontmatter,
+injection, or substitution finding still needs an actual rewrite, since a `compatibility` note
+can't excuse a hard upload error the way it can excuse an undocumented credential requirement.
 
 ## 7. Documenting the gap you can't close (Confirmed as good practice)
 
