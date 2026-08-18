@@ -237,3 +237,99 @@ a `skills/` directory with siblings like `agents/`, `hooks/`, `.mcp.json`):
   than SKILL.md's strict allowlist, but keep it to the documented fields (`name`, `version`,
   `description`, `author`, `homepage`, `repository`, `license`, `keywords`, plus the optional
   `commands`/`agents`/`hooks`/`mcpServers` path overrides).
+
+## 9. Hardcoded MCP server/tool names (Heuristic)
+
+MCP tools show up in the toolset as `mcp__<server>__<tool>`, and it's tempting to write a skill
+step as "call `mcp__tableau__query_datasource`" the same way you'd name a first-party tool like
+`Bash`. The difference: `<server>` isn't part of any spec -- it's whatever name the connector
+happened to get configured under, and that's set per user, per org, or per session, not by the
+tool's author. The same underlying Tableau/Salesforce/whatever integration can be
+`mcp__tableau__`, `mcp__tableau-prod__`, or `mcp__acme-tableau__` depending entirely on who set
+it up. On top of that, Cowork frequently defers MCP tools until something calls `ToolSearch` for
+them -- a skill that assumes the exact name is already loaded can fail to find it even when the
+right connector genuinely is connected.
+
+This does NOT apply to Cowork's own two fixed platform bridges -- `mcp__remote-devices__*` (the
+desktop bridge) and `mcp__claude-code-remote__*` (the scheduled-task system) -- those are stable,
+first-party namespaces already covered by rule 4, not user-configured connectors. The scanner
+exempts both prefixes from this rule for exactly that reason.
+
+**Fix**: describe the capability, not the tool name -- "query the Tableau datasource for X" --
+and tell Claude to resolve the actual tool at runtime: a `ToolSearch` call in Cowork (matching on
+keywords like "tableau query-datasource"), or its already-loaded MCP tool list in Claude Code.
+This is precisely the pattern a well-built skill in the wild already uses for exactly this
+problem:
+
+> MCP tools are often DEFERRED in Cowork -- run a ToolSearch for "tableau query-datasource" first
+> and use whichever server resolves. Never assume a specific `mcp__<server>__` prefix; it varies
+> by session (claude.ai connector, desktop-proxied server, org gateway).
+
+That's the shape to teach: name what you're looking for, discover the real tool name at runtime,
+never hardcode the middle segment.
+
+## 10. Credential loading across two very different sandboxes (Heuristic)
+
+Reading a required env var (rule 6) is only half the story -- the harder question is *how does
+the value actually get into the process* on each product, because the two run in genuinely
+different conditions:
+
+- **Claude Code** runs on the user's own machine with a persistent shell. `export FOO=bar` in
+  their profile, or a `.env` file sitting next to the skill's scripts, both work fine and persist
+  across sessions.
+- **Cowork's sandbox starts clean every session.** There's no shell profile to pre-export into,
+  and the skill's own directory (synced from a claude.ai account or a plugin install) generally
+  isn't a sensible place for a user to drop a private credentials file even if they could. The
+  one place a user's own file reliably lands is wherever uploaded conversation attachments go
+  (the session's uploads directory) -- which the skill has to know to check, since it's a
+  different location than "next to the script."
+
+Two concrete things to flag:
+
+- **A `python-dotenv` dependency** (`from dotenv import ...`, `import dotenv`, `load_dotenv(`).
+  It's a fine library, but it's an *extra* pip package -- not guaranteed present in Cowork's
+  fixed sandbox image or on a Claude Code user's already-installed packages. A script that
+  imports it unconditionally will `ImportError` before it ever reaches the "credential missing"
+  message it was trying to produce, which is a worse failure than the one it was guarding against.
+- **An env var read with no working setup path**, even once it's named in `compatibility` (rule
+  6's suppression only means "the requirement is documented," not "there's a way to satisfy it on
+  both products").
+
+**Fix -- a small stdlib-only loader**, no extra dependency, that checks the environment first and
+only then looks for a `.env`-style file in a couple of predictable places, ending in an error
+that names the fix for *both* products explicitly rather than a bare `KeyError`/`None`:
+
+```python
+import os
+from pathlib import Path
+
+def load_env(var_names, extra_search_paths=()):
+    missing = [v for v in var_names if v not in os.environ]
+    if missing:
+        for d in (Path(__file__).resolve().parent, *[Path(p) for p in extra_search_paths]):
+            env_file = d / ".env"
+            if not env_file.exists():
+                continue
+            for line in env_file.read_text().splitlines():
+                line = line.strip()
+                if not line or line.startswith("#") or "=" not in line:
+                    continue
+                k, _, v = line.partition("=")
+                os.environ.setdefault(k.strip(), v.strip().strip('"').strip("'"))
+            missing = [v for v in var_names if v not in os.environ]
+            if not missing:
+                break
+    if missing:
+        raise RuntimeError(
+            f"Missing required env var(s): {', '.join(missing)}.\n"
+            f"Claude Code: export them in your shell, or drop a .env file next to this script.\n"
+            f"Cowork: upload a .env file into this conversation, then pass the uploads "
+            f"directory in extra_search_paths -- or wire up a connector/secret that sets "
+            f"these for you instead of a raw token."
+        )
+```
+
+The point isn't that this exact function is mandatory -- it's the shape: environment first,
+then a discoverable file in more than one plausible location, then a specific and actionable
+error naming what to do on *each* product, never a silent `None` that surfaces as a confusing
+failure three steps later.

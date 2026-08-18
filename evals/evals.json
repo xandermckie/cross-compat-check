@@ -24,6 +24,12 @@
       "prompt": "Can you check my plugin's skill for cross-compatibility before I ship it? The skill is at /home/claude/fixtures/plugin-fixture/skills/sync-data -- it's part of a bigger plugin (there's a hooks/ and agents/ folder alongside the skills/ folder). It syncs data using an API token and a deploy secret it reads from the environment.",
       "expected_output": "Should run the scanner, correctly walk through the plugin-level findings (hooks/hooks.json present -- verify it works in Cowork; agents/ present -- same; and the hardcoded /home/xander/... path inside hooks/hooks.json, which should be flagged as confirmed and fixed to use ${CLAUDE_PLUGIN_ROOT} instead). Should also flag the undocumented DEPLOY_SECRET env var (read via both os.getenv() in sync.py and $DEPLOY_SECRET in sync.sh) but should NOT flag SYNC_API_TOKEN, since that one is already documented in the skill's own compatibility field -- this is the key behavior being tested. Should not flag $HOME in sync.sh.",
       "files": []
+    },
+    {
+      "id": 5,
+      "prompt": "Can you check this skill for cross-compatibility? It's at /home/claude/fixtures/mcp-env-fixture -- it calls an MCP tool directly by name and loads credentials with python-dotenv, and there's a references/setup.md with more setup instructions.",
+      "expected_output": "Should run the scanner and walk through all 6 findings: the hardcoded mcp__acme-crm__list_contacts reference in SKILL.md (explain that the server-name segment isn't portable across users/sessions/orgs and propose describing the capability + resolving the tool at runtime via ToolSearch/the loaded MCP list instead), the python-dotenv import and load_dotenv() call in scripts/loader.py (explain it's an extra pip dependency not guaranteed present on either product and propose the stdlib-only .env loader pattern from compat-rules.md rule 10), the undocumented ACME_API_KEY env var read, and -- this is the key behavior being tested -- the two findings that live in references/setup.md rather than SKILL.md itself (the hardcoded /home/alice/... absolute path, and the AskUserQuestion reference), proving the scanner checks reference docs too, not just the entry-point file. Should NOT propose a compatibility-field fix for the MCP-hardcode or dotenv findings, since those need an actual rewrite, not documentation.",
+      "files": []
     }
   ]
 }

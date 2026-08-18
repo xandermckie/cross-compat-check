@@ -1,17 +1,16 @@
 ---
 name: cross-compat-check
 description: >
-  Audits a skill you've authored for places where it would behave differently -- or silently
-  break -- depending on whether it runs in Claude Code or in Cowork, before you check it into
-  GitHub to share. Detects Claude Code-only frontmatter fields that hard-error on claude.ai
-  upload, shell-injection and ${CLAUDE_*} substitution syntax that goes inert outside Claude
-  Code, references to tools that only exist on one product (AskUserQuestion, SendUserFile,
-  TaskCreate/TaskUpdate, the device bridge, hooks, TodoWrite, etc.), hardcoded paths, and
-  Cowork-only filesystem assumptions like an "outputs directory". Walks through each finding
-  one at a time -- explaining the risk and a concrete fix -- and applies the fixes you approve.
-  Use this whenever the user wants to check a skill for cross-compatibility, portability, or
-  "does this work in both Claude Code and Cowork", before publishing, sharing, or pushing a
-  skill to GitHub, or when they mention a skill breaking on one product but not the other.
+  Audits a skill you've authored for places where it behaves differently -- or silently breaks
+  -- between Claude Code and Cowork, before you check it into GitHub. Detects Claude Code-only
+  frontmatter fields, shell-injection/${CLAUDE_*} substitution that goes inert outside Claude
+  Code, one-product-only tool references (AskUserQuestion, SendUserFile, TaskCreate/TaskUpdate,
+  device bridge, hooks, TodoWrite, etc.), hardcoded paths and MCP server/tool prefixes,
+  credential-loading gaps (python-dotenv dependency, env vars with no working setup path on
+  Cowork's clean sandbox), and Cowork-only filesystem assumptions like an "outputs directory".
+  Walks through findings one at a time with a risk explanation and concrete fix, applying what
+  you approve. Use whenever checking a skill for cross-compatibility or portability before
+  sharing it, or when a skill breaks on one product but not the other.
 license: MIT
 compatibility: Runs the bundled scan_skill.py with Python 3 (no external dependencies) and edits
   files with Edit -- works in both Claude Code and Cowork.
@@ -118,6 +117,16 @@ A few callibration notes so you don't over- or under-call things:
   compat-rules.md), don't force a rewrite -- propose adding or updating the `compatibility`
   frontmatter field instead, so the limitation is documented rather than discovered by a
   confused user later.
+- Hardcoded MCP tool names (rule 9) and a `python-dotenv` dependency (rule 10) do NOT have a
+  `compatibility`-field escape valve the way a plain env-var read does -- naming the requirement
+  in frontmatter documents it, but doesn't make a hardcoded `mcp__<server>__` prefix resolve on a
+  different session, or make an unavailable pip package importable. These two need an actual
+  rewrite; don't propose "just document it" for them.
+- For env-var findings specifically, the fix is stronger than "add a compatibility note" -- the
+  real goal is a setup path that actually works on Cowork's clean-per-session sandbox, not just a
+  documented requirement. See compat-rules.md rule 10 for the stdlib-only loader pattern (checks
+  `os.environ` first, then a discoverable `.env` file, then a specific per-product error) and
+  propose it when a skill has more than one or two required credentials.
 
 ## Step 4: Re-scan and summarize
 
@@ -134,6 +143,10 @@ reasonable to tell the user the skill is ready to check into GitHub -- don't say
   findings and dismissing two is cheaper than a human never being shown the one that mattered.
   Don't apologize for or downplay findings that turn out to be non-issues -- just say so and
   move on.
+- The scanner reads SKILL.md and every markdown file under `references/`, plus any bundled
+  `scripts/*.py`, `*.js`, `*.ts`, `*.sh` -- setup/runbook instructions (MCP discovery steps,
+  credential wiring) often live in a reference doc rather than SKILL.md itself, and a hardcoded
+  assumption there is just as real a break as one in the entry-point file.
 - The tool-name lists in `compat-rules.md` (and mirrored in `scan_skill.py`) are a best-effort
   snapshot, not a guaranteed-current spec -- `compat-rules.md` carries a "last verified" date at
   the top for exactly this reason. If you're ever unsure whether something is genuinely

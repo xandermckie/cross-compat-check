@@ -118,6 +118,27 @@ PLATFORM_PROVIDED_ENV = {
     "TEMP", "HOSTNAME", "SHLVL", "IFS", "PS1", "PS2",
 }
 
+# --- Rule 9: hardcoded MCP server/tool name references ----------------------------------------
+
+# Cowork's own bridge namespaces are stable, platform-level prefixes (already covered above in
+# COWORK_ONLY_TOOLS) -- not a user-configured MCP connector, so they're exempt from this rule.
+# Everything else matching mcp__<server>__<tool> is a *third-party* MCP connector, and that
+# server-name segment is assigned however the connector happened to get configured -- it is not
+# part of any spec, so a different user, org, or session can register the identical integration
+# under a different name entirely.
+STABLE_MCP_PREFIXES = ("mcp__remote-devices__", "mcp__claude-code-remote__")
+
+MCP_TOOL_REF_PATTERN = re.compile(r"\bmcp__([\w-]+)__([\w-]+)\b")
+
+# --- Rule 10: credential-loading assumptions (.env / dotenv) -----------------------------------
+
+# python-dotenv is a real, common pattern for local credential loading, but it's an extra pip
+# dependency -- not guaranteed present in Cowork's sandbox (a fixed preinstalled set) or on a
+# Claude Code user's machine (whatever they happened to already `pip install`). A script that
+# imports it and has no fallback will ImportError before it even gets to the "missing credential"
+# error it was trying to produce.
+DOTENV_PACKAGE_PATTERN = re.compile(r"\b(?:from\s+dotenv\s+import\s+\w+|import\s+dotenv|load_dotenv\s*\()")
+
 
 def parse_frontmatter(text):
     """Minimal, dependency-free frontmatter parser. Good enough for flat key: value pairs and
@@ -286,6 +307,33 @@ def scan_skill_md(path: Path):
                 "fix": "Describe the outcome ('make sure the user ends up with file X') and let the body branch on what's actually available rather than assuming one delivery mechanism.",
             })
 
+    for m in MCP_TOOL_REF_PATTERN.finditer(body):
+        prefix = f"mcp__{m.group(1)}__"
+        if prefix in STABLE_MCP_PREFIXES:
+            continue
+        findings.append({
+            "id": f"mcp-hardcoded-{m.group(1)}-{m.group(2)}-{m.start()}",
+            "confidence": "heuristic",
+            "category": "mcp-reference",
+            "file": str(path),
+            "line": line_number_for(text, body_offset + m.start()),
+            "snippet": body[max(0, m.start() - 20):m.start() + len(m.group(0)) + 10].replace("\n", " ").strip(),
+            "risk": f"Hardcodes the MCP server prefix \"{prefix}\" for tool \"{m.group(2)}\". That server-name segment isn't part of any spec -- a different user, org, or session can register the identical connector under a different prefix, and in Cowork many MCP tools are deferred until a ToolSearch call resolves them. A hardcoded prefix that doesn't match silently fails to find the tool.",
+            "fix": "Describe the capability you need (e.g. \"query the Tableau datasource\") and tell Claude to resolve the actual tool -- via ToolSearch in Cowork, or its already-loaded MCP tool list in Claude Code -- rather than assuming this exact name. See compat-rules.md rule 9.",
+        })
+
+    for m in DOTENV_PACKAGE_PATTERN.finditer(body):
+        findings.append({
+            "id": f"dotenv-dependency-{m.start()}",
+            "confidence": "heuristic",
+            "category": "environment",
+            "file": str(path),
+            "line": line_number_for(text, body_offset + m.start()),
+            "snippet": m.group(0),
+            "risk": "Depends on the python-dotenv package, which isn't guaranteed installed in Cowork's sandbox or on a Claude Code user's machine -- this will ImportError before it even gets to the credential check it was trying to do.",
+            "fix": "Read a .env-style file with a small stdlib-only parser instead (a few lines: split on the first \"=\", strip quotes/whitespace, skip blank/# lines) so there's no extra dependency to install. See compat-rules.md rule 10 for the pattern.",
+        })
+
     # Rule 6/7 combined: an env var read only stays a "go fix this" finding if the skill hasn't
     # already documented it. Rule 7's actual fix for an env var IS the compatibility field -- so
     # once that field mentions the variable by name, the finding has already been acted on and
@@ -307,8 +355,139 @@ def scan_skill_md(path: Path):
                 "line": line_number_for(text, m.start()),
                 "snippet": m.group(0),
                 "risk": f"Reads env var {var}, which isn't obviously platform-provided. Cowork's sandbox starts clean aside from what the platform sets.",
-                "fix": "Document the required env var explicitly (README or the `compatibility` field) rather than assuming it's set.",
+                "fix": "Document the required env var explicitly (README or the `compatibility` field), and give it an actual working path to get set on both products -- see compat-rules.md rule 10 for the stdlib-only loader pattern that checks os.environ first and falls back to a discoverable .env-style file rather than just erroring.",
             })
+
+    return findings
+
+
+def scan_reference_docs(skill_dir: Path, compat_text: str):
+    """Apply the same prose-level checks (tool references, filesystem assumptions, hardcoded MCP
+    prefixes, env-var reads, dotenv dependency) to markdown files under references/ -- these are
+    exactly where setup/runbook instructions tend to live (the actual MCP-discovery and
+    credential-loading guidance a skill gives a user is often in a references/*.md, not
+    SKILL.md itself), and a hardcoded assumption there is just as real a portability break as one
+    in SKILL.md. Unlike SKILL.md, these files aren't preprocessed by Claude Code before the model
+    reads them, so frontmatter/shell-injection/${CLAUDE_*}-substitution rules don't apply here."""
+    findings = []
+    references_dir = skill_dir / "references"
+    if not references_dir.exists():
+        return findings
+
+    for doc_path in sorted(references_dir.rglob("*.md")):
+        if not doc_path.is_file():
+            continue
+        doc_text = doc_path.read_text(encoding="utf-8", errors="replace")
+
+        for name in COWORK_ONLY_TOOLS:
+            for m in re.finditer(re.escape(name), doc_text):
+                findings.append({
+                    "id": f"cowork-tool-{doc_path.name}-{name}-{m.start()}",
+                    "confidence": "heuristic",
+                    "category": "tool-reference",
+                    "file": str(doc_path),
+                    "line": line_number_for(doc_text, m.start()),
+                    "snippet": doc_text[max(0, m.start() - 30):m.start() + len(name) + 10].replace("\n", " ").strip(),
+                    "risk": f"'{name}' is a Cowork-side tool with no confirmed Claude Code equivalent. A step relying on it will silently fail to do what's intended when this skill runs under Claude Code.",
+                    "fix": "Rewrite as a check-and-fallback: name the preferred tool, then give an explicit fallback for when it's unavailable.",
+                })
+
+        for name in CLAUDE_CODE_ONLY_REFERENCES:
+            for m in re.finditer(re.escape(name), doc_text):
+                findings.append({
+                    "id": f"claudecode-ref-{doc_path.name}-{name}-{m.start()}",
+                    "confidence": "heuristic",
+                    "category": "tool-reference",
+                    "file": str(doc_path),
+                    "line": line_number_for(doc_text, m.start()),
+                    "snippet": doc_text[max(0, m.start() - 30):m.start() + len(name) + 10].replace("\n", " ").strip(),
+                    "risk": f"'{name}' is a Claude Code-side convention/tool with no confirmed Cowork equivalent.",
+                    "fix": "Rewrite as a check-and-fallback, or describe the goal generically and let Claude pick the right mechanism for whichever surface it's running on.",
+                })
+
+        for pattern, note in SUBAGENT_NAME_TRAP:
+            for m in re.finditer(pattern, doc_text):
+                findings.append({
+                    "id": f"subagent-name-trap-{doc_path.name}-{m.start()}",
+                    "confidence": "heuristic",
+                    "category": "tool-reference",
+                    "file": str(doc_path),
+                    "line": line_number_for(doc_text, m.start()),
+                    "snippet": doc_text[max(0, m.start() - 30):m.start() + 30].replace("\n", " ").strip(),
+                    "risk": note,
+                    "fix": "Use a generic phrase like 'spawn a subagent to do X' rather than naming the tool, since the name differs across products.",
+                })
+
+        for pat in ABS_PATH_PATTERNS:
+            for m in pat.finditer(doc_text):
+                findings.append({
+                    "id": f"abs-path-{doc_path.name}-{m.start()}",
+                    "confidence": "heuristic",
+                    "category": "filesystem",
+                    "file": str(doc_path),
+                    "line": line_number_for(doc_text, m.start()),
+                    "snippet": m.group(0),
+                    "risk": "Hardcoded absolute path. Fragile in Claude Code (varies per user) and almost certainly wrong in Cowork's cloud sandbox (different filesystem layout entirely).",
+                    "fix": "Use a relative reference, or an instruction that asks the environment for the right location rather than assuming one.",
+                })
+
+        for pat, note in DELIVERY_PHRASES:
+            for m in pat.finditer(doc_text):
+                findings.append({
+                    "id": f"delivery-phrase-{doc_path.name}-{m.start()}",
+                    "confidence": "heuristic",
+                    "category": "filesystem",
+                    "file": str(doc_path),
+                    "line": line_number_for(doc_text, m.start()),
+                    "snippet": doc_text[max(0, m.start() - 20):m.start() + 40].replace("\n", " ").strip(),
+                    "risk": note,
+                    "fix": "Describe the outcome ('make sure the user ends up with file X') and let the body branch on what's actually available rather than assuming one delivery mechanism.",
+                })
+
+        for m in MCP_TOOL_REF_PATTERN.finditer(doc_text):
+            prefix = f"mcp__{m.group(1)}__"
+            if prefix in STABLE_MCP_PREFIXES:
+                continue
+            findings.append({
+                "id": f"mcp-hardcoded-{doc_path.name}-{m.group(1)}-{m.group(2)}-{m.start()}",
+                "confidence": "heuristic",
+                "category": "mcp-reference",
+                "file": str(doc_path),
+                "line": line_number_for(doc_text, m.start()),
+                "snippet": doc_text[max(0, m.start() - 20):m.start() + len(m.group(0)) + 10].replace("\n", " ").strip(),
+                "risk": f"Hardcodes the MCP server prefix \"{prefix}\" for tool \"{m.group(2)}\". That server-name segment isn't part of any spec -- a different user, org, or session can register the identical connector under a different prefix, and in Cowork many MCP tools are deferred until a ToolSearch call resolves them. A hardcoded prefix that doesn't match silently fails to find the tool.",
+                "fix": "Describe the capability you need and tell Claude to resolve the actual tool -- via ToolSearch in Cowork, or its already-loaded MCP tool list in Claude Code -- rather than assuming this exact name. See compat-rules.md rule 9.",
+            })
+
+        for m in DOTENV_PACKAGE_PATTERN.finditer(doc_text):
+            findings.append({
+                "id": f"dotenv-dependency-{doc_path.name}-{m.start()}",
+                "confidence": "heuristic",
+                "category": "environment",
+                "file": str(doc_path),
+                "line": line_number_for(doc_text, m.start()),
+                "snippet": m.group(0),
+                "risk": "Recommends/depends on the python-dotenv package, which isn't guaranteed installed in Cowork's sandbox or on a Claude Code user's machine.",
+                "fix": "Recommend a small stdlib-only .env parser instead so there's no extra dependency to install. See compat-rules.md rule 10 for the pattern.",
+            })
+
+        for pat in ENV_VAR_PATTERNS:
+            for m in pat.finditer(doc_text):
+                var = m.group(1)
+                if var in PLATFORM_PROVIDED_ENV or var.startswith("CLAUDE_"):
+                    continue
+                if var.lower() in compat_text.lower():
+                    continue
+                findings.append({
+                    "id": f"env-var-{doc_path.name}-{var}-{m.start()}",
+                    "confidence": "heuristic",
+                    "category": "environment",
+                    "file": str(doc_path),
+                    "line": line_number_for(doc_text, m.start()),
+                    "snippet": m.group(0),
+                    "risk": f"Reads env var {var}, which isn't obviously platform-provided. Cowork's sandbox starts clean aside from what the platform sets.",
+                    "fix": "Document the required env var explicitly (README or the `compatibility` field), and give it an actual working path to get set on both products -- see compat-rules.md rule 10.",
+                })
 
     return findings
 
@@ -404,6 +583,10 @@ def main():
     skill_fields, _ = parse_frontmatter(skill_text)
     compat_text = skill_fields.get("compatibility", "")
 
+    # References often carry the actual setup/runbook instructions (MCP discovery steps,
+    # credential wiring) rather than SKILL.md itself -- scan them with the same suppression.
+    findings += scan_reference_docs(skill_dir, compat_text)
+
     # also scan any bundled scripts for shell-injection-style patterns is out of scope --
     # scripts are executed, not preprocessed, so the injection/substitution rules don't apply
     # to them. Bundled scripts are still worth an env-var pass though.
@@ -436,20 +619,48 @@ def main():
                         "line": line_number_for(script_text, m.start()),
                         "snippet": m.group(0),
                         "risk": f"Bundled script reads env var {var}, which isn't obviously platform-provided.",
-                        "fix": "Document the required env var explicitly (README or the `compatibility` field).",
+                        "fix": "Document the required env var explicitly (README or the `compatibility` field), and give it a working cross-platform loading path -- see compat-rules.md rule 10.",
                     })
-                for pat in ABS_PATH_PATTERNS:
-                    for m in pat.finditer(script_text):
-                        findings.append({
-                            "id": f"script-abs-path-{script_file.name}-{m.start()}",
-                            "confidence": "heuristic",
-                            "category": "filesystem",
-                            "file": str(script_file),
-                            "line": line_number_for(script_text, m.start()),
-                            "snippet": m.group(0),
-                            "risk": "Hardcoded absolute path in a bundled script.",
-                            "fix": "Use a path relative to the script's own location (e.g. via the script's __file__/dirname), not a hardcoded absolute path.",
-                        })
+            # NOTE: this loop is a sibling of `for pat in patterns:` above, not nested inside it --
+            # it used to be indented one level too deep, which ran the abs-path scan once per
+            # env-var pattern (5x duplicate findings on a .py file) instead of once per script.
+            for pat in ABS_PATH_PATTERNS:
+                for m in pat.finditer(script_text):
+                    findings.append({
+                        "id": f"script-abs-path-{script_file.name}-{m.start()}",
+                        "confidence": "heuristic",
+                        "category": "filesystem",
+                        "file": str(script_file),
+                        "line": line_number_for(script_text, m.start()),
+                        "snippet": m.group(0),
+                        "risk": "Hardcoded absolute path in a bundled script.",
+                        "fix": "Use a path relative to the script's own location (e.g. via the script's __file__/dirname), not a hardcoded absolute path.",
+                    })
+            for m in MCP_TOOL_REF_PATTERN.finditer(script_text):
+                prefix = f"mcp__{m.group(1)}__"
+                if prefix in STABLE_MCP_PREFIXES:
+                    continue
+                findings.append({
+                    "id": f"script-mcp-hardcoded-{script_file.name}-{m.group(1)}-{m.group(2)}-{m.start()}",
+                    "confidence": "heuristic",
+                    "category": "mcp-reference",
+                    "file": str(script_file),
+                    "line": line_number_for(script_text, m.start()),
+                    "snippet": script_text[max(0, m.start() - 20):m.start() + len(m.group(0)) + 10].replace("\n", " ").strip(),
+                    "risk": f"Hardcodes the MCP server prefix \"{prefix}\" for tool \"{m.group(2)}\". That server-name segment isn't part of any spec -- a different user, org, or session can register the identical connector under a different prefix.",
+                    "fix": "Describe the capability needed and let Claude resolve the actual tool name at runtime rather than embedding this exact string. See compat-rules.md rule 9.",
+                })
+            for m in DOTENV_PACKAGE_PATTERN.finditer(script_text):
+                findings.append({
+                    "id": f"script-dotenv-dependency-{script_file.name}-{m.start()}",
+                    "confidence": "heuristic",
+                    "category": "environment",
+                    "file": str(script_file),
+                    "line": line_number_for(script_text, m.start()),
+                    "snippet": m.group(0),
+                    "risk": "Depends on the python-dotenv package, which isn't guaranteed installed in Cowork's sandbox or on a Claude Code user's machine -- this will ImportError before it even gets to the credential check it was trying to do.",
+                    "fix": "Read a .env-style file with a small stdlib-only parser instead (split each line on the first \"=\", strip quotes/whitespace, skip blank/# lines). See compat-rules.md rule 10 for the pattern.",
+                })
 
     result = {
         "skill_md": str(skill_md),
