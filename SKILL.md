@@ -8,8 +8,9 @@ description: >
   device bridge, hooks, TodoWrite, etc.), hardcoded paths and MCP server/tool prefixes,
   credential-loading gaps (python-dotenv dependency, env vars with no working setup path on
   Cowork's clean sandbox), and Cowork-only filesystem assumptions like an "outputs directory".
-  Walks through findings one at a time with a risk explanation and concrete fix, applying what
-  you approve. Use whenever checking a skill for cross-compatibility or portability before
+  Also applies domain-specific rule packs (e.g. Tableau connector requirements) when a skill
+  matches. Walks through findings one at a time with a risk explanation and concrete fix, applying
+  what you approve. Use whenever checking a skill for cross-compatibility or portability before
   sharing it, or when a skill breaks on one product but not the other.
 license: MIT
 compatibility: Runs the bundled scan_skill.py with Python 3 (no external dependencies) and edits
@@ -67,8 +68,25 @@ assumed, and the user should see that regardless of whether problems turned up. 
 present these before every other finding, since nothing about cross-compat matters if the script
 doesn't even run.
 
-If the scan comes back with zero findings, say so plainly (including the verification summary)
-and skip straight to Step 4 -- don't manufacture things to ask about.
+The JSON also includes a top-level `tableau_domain_pack` object with `applicable` (true only when
+the skill looks Tableau-related -- reads `TABLEAU_*` env vars, or "tableau"/VizQL/VDS-style terms
+show up in its own text) and, when applicable, a `manual_checklist`. That checklist is not
+optional busywork: `references/tableau-rules.md` (R1-R7, the org's Tableau cross-compatibility
+requirements) has real findings the regex scanner cannot produce -- whether the environment
+selection is genuinely deterministic (R1), whether the stated Cowork connector preference order
+is actually correct and includes mid-task failover (R2), whether the same query JSON is sent on
+every transport (R6), and whether failure/success is actually auditable in the output (R7). These
+need you to read the skill's real logic, the same way you'd verify any other judgment-call
+finding -- work through every checklist item during Step 3, right alongside the mechanical
+findings the scanner did produce for R2's hardcoded-literal check, R3's missing no-auth
+guardrail, R4's credential-contract/secret-logging checks, and R5's portability grep. If
+`applicable` is false, skip the checklist entirely -- don't go looking for Tableau issues in a
+skill that isn't Tableau-related.
+
+If the scan comes back with zero findings and `tableau_domain_pack.applicable` is false, say so
+plainly (including the verification summary) and skip straight to Step 4 -- don't manufacture
+things to ask about. If `applicable` is true, zero mechanical findings still means walking through
+the manual checklist before Step 4, since that's where this domain's real risk usually lives.
 
 ## Step 3: Walk through findings one at a time (grill-me style)
 
@@ -145,6 +163,19 @@ A few callibration notes so you don't over- or under-call things:
   documented requirement. See compat-rules.md rule 10 for the stdlib-only loader pattern (checks
   `os.environ` first, then a discoverable `.env` file, then a specific per-product error) and
   propose it when a skill has more than one or two required credentials.
+- A `tableau_domain_pack.manual_checklist` item isn't a pre-packaged finding -- there's no snippet
+  or fix to read off. Before you can even ask the user about it, go read the skill's actual
+  transport-selection code, its stated connector preference order, its per-transport
+  query-building, and its exit-code/output-recording logic (whichever the checklist item calls
+  for), and form a real opinion grounded in what the code does -- not the docstrings or naming
+  alone. Only once you have a concrete finding (or a concrete "this one's clean") does it become
+  something to walk through one-at-a-time the same way as any other finding: explain what you
+  read and why it matters, propose a specific fix if you found a real gap, and use
+  `AskUserQuestion` (or its plain-text fallback) exactly as you would for a scanner-produced
+  finding. Don't silently apply a fix to something as consequential as a stated connector
+  preference order (R2) without the user's explicit sign-off -- the skill author may have a
+  legitimate, documented reason for their current choice that the org spec doesn't account for,
+  and overwriting it unilaterally would be a worse outcome than asking.
 
 ## Step 4: Re-scan and summarize
 
@@ -180,3 +211,11 @@ reasonable to tell the user the skill is ready to check into GitHub -- don't say
   punishing it would be a false positive. A passing import check only proves the package is
   importable in *this* scanning environment, not in Cowork's sandbox or the end user's Claude
   Code install -- say that caveat out loud rather than implying the check guarantees portability.
+- The Tableau domain rule pack (`references/tableau-rules.md`, R1-R7) only activates when the
+  target skill looks Tableau-related, and even then only R2 (hardcoded-literal), R3 (missing
+  no-auth guardrail), R4 (credential contract + secret-logging), and R5 (portability grep) are
+  mechanically checked -- same confidence semantics as rules 1-10 (`heuristic`, text-pattern
+  inference). R1, R2's actual preference-order correctness, R6, and R7 are handed back as
+  `tableau_domain_pack.manual_checklist` instead of a finding, because answering them requires
+  reading the skill's real transport-selection and query-building logic, not matching a pattern --
+  don't skip that checklist just because it didn't come with a snippet and a `fix` field attached.

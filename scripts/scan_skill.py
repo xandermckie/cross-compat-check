@@ -142,6 +142,213 @@ MCP_TOOL_REF_PATTERN = re.compile(r"\bmcp__([\w-]+)__([\w-]+)\b")
 # error it was trying to produce.
 DOTENV_PACKAGE_PATTERN = re.compile(r"\b(?:from\s+dotenv\s+import\s+\w+|import\s+dotenv|load_dotenv\s*\()")
 
+# --- Tableau domain rule pack (references/tableau-rules.md) ------------------------------------
+#
+# Activates only when the target skill looks Tableau-related. This is layered on top of the
+# general rules above, not a replacement -- a Tableau skill still gets rules 1-10 too. Only the
+# mechanically-checkable slices of R1-R7 live here; R1's "is this actually deterministic" and
+# R2's "is the stated preference order actually right" and R6/R7 require reading the skill's real
+# logic, which is the calling skill's job during the walkthrough, not something regex can settle.
+
+TABLEAU_KEYWORD_PATTERN = re.compile(r"\btableau\b", re.IGNORECASE)
+TABLEAU_TECH_TERMS = re.compile(r"\bVizQL\b|\bVDS\b|datasource_luid|query-?datasource", re.IGNORECASE)
+TABLEAU_ENV_VAR_PATTERN = re.compile(r"\bTABLEAU_[A-Z_]+\b")
+TABLEAU_STANDARD_CREDENTIAL_VARS = {"TABLEAU_PAT_NAME", "TABLEAU_PAT_VALUE"}
+TABLEAU_STANDARD_OPTIONAL_VARS = {"TABLEAU_SERVER", "TABLEAU_SITE"}
+
+TABLEAU_MCP_LITERAL_PATTERN = re.compile(r"\bmcp__[\w-]*[Tt][Aa][Bb][Ll][Ee][Aa][Uu][\w-]*__[\w-]+\b")
+PREFIX_TOLERANT_LANGUAGE_PATTERN = re.compile(
+    r"pattern[- ]match|ToolSearch|prefix[- ]tolerant|never assume a specific|whichever (server|connector) resolves",
+    re.IGNORECASE,
+)
+
+TABLEAU_SECRET_LOG_PATTERN = re.compile(
+    r"\b(?:print|log(?:ger)?\.\w+)\s*\([^)]*\b(?:PAT_VALUE|pat_value|TABLEAU_TOKEN|tableau_token|token|secret)\b",
+    re.IGNORECASE,
+)
+
+MCPORTER_PATTERN = re.compile(r"\bmcporter\b")
+VENV_PATTERN = re.compile(r"\.venv\b")
+
+AUTHORIZATION_FLOW_PATTERN = re.compile(r"/authorize\b|\belicitation\b|\bOAuth\b|\bauthorization flow\b", re.IGNORECASE)
+NO_AUTH_INSTRUCTION_PATTERN = re.compile(r"never\s+(?:trigger|initiate|start)[^.]*authoriz", re.IGNORECASE)
+
+# R1/R2/R6/R7 aren't fully mechanically checkable (see tableau-rules.md for why -- they require
+# reading the skill's actual transport-selection logic, stated preference order, and per-transport
+# query-building code, not just its text patterns). This checklist is surfaced to the calling
+# skill alongside any mechanical findings so those questions don't get silently skipped just
+# because the scanner can't answer them itself.
+TABLEAU_MANUAL_REVIEW_CHECKLIST = [
+    {
+        "rule": "R1",
+        "question": "Read the actual transport-selection logic (not just the docs): is which connection "
+                     "method to use decided by credential PRESENCE, checked before any connection attempt "
+                     "-- never by trying a connection and reacting to whether it succeeds? Also check "
+                     "surrounding prose for 'try this first, and if it fails, try that' framing that reads "
+                     "as trial-and-error even when the underlying code is correctly gated.",
+    },
+    {
+        "rule": "R2",
+        "question": "Read the skill's actual stated preference order for Cowork connectors: does it "
+                     "prefer the desktop-bridge Tableau extension first, with the cloud-side connector as "
+                     "fallback -- including mid-task failover if the bridge drops? A skill can avoid "
+                     "hardcoding a literal tool name while still stating the wrong order, or omitting "
+                     "failover entirely -- neither is caught by the mechanical hardcoded-literal check.",
+    },
+    {
+        "rule": "R6",
+        "question": "Read the query-building code across every transport path this skill supports: is "
+                     "the same VizQL/query JSON sent verbatim on each, with only transport-unsupported "
+                     "parameters (e.g. limit on direct VDS calls) handled client-side rather than by "
+                     "forking the query format per transport?",
+    },
+    {
+        "rule": "R7",
+        "question": "Read the skill's documented exit codes/status fields and its actual output artifact "
+                     "(report, pack, log): does it distinguish 'Tableau unreachable / not authenticated' "
+                     "from partial data and from skill bugs, and does the output actually record which "
+                     "connection path produced the run -- not just that it could?",
+    },
+]
+
+
+def is_tableau_related(text_blobs):
+    """text_blobs: iterable of strings (SKILL.md body, reference docs, bundled script contents).
+    True if the skill looks Tableau-related, per the heuristic documented in tableau-rules.md:
+    "tableau" appears more than once, or Tableau-specific tech terms/env vars show up at all
+    (those are specific enough that even a single hit is a strong signal, unlike the bare word
+    "tableau" which could plausibly appear once in an unrelated sentence)."""
+    combined = "\n".join(text_blobs)
+    if len(TABLEAU_KEYWORD_PATTERN.findall(combined)) >= 2:
+        return True
+    if TABLEAU_TECH_TERMS.search(combined):
+        return True
+    if TABLEAU_ENV_VAR_PATTERN.search(combined):
+        return True
+    return False
+
+
+def scan_tableau_rules(skill_dir: Path, skill_md_path: Path, skill_md_text: str):
+    """Domain rule pack for Tableau-connecting skills (references/tableau-rules.md), layered on
+    top of every general rule above. Only activates when is_tableau_related() says yes. Only the
+    mechanically-checkable slices of R2/R3/R4/R5 are implemented here as real findings; R1, the
+    non-mechanical half of R2, R6, and R7 come back as a `manual_checklist` instead, since they
+    require reading the skill's actual logic, not matching a pattern. Returns
+    {"applicable": bool, "findings": [...], "manual_checklist": [...]}."""
+    blobs = [(str(skill_md_path), skill_md_text)]
+
+    references_dir = skill_dir / "references"
+    if references_dir.exists():
+        for doc_path in sorted(references_dir.rglob("*.md")):
+            if doc_path.is_file():
+                blobs.append((str(doc_path), doc_path.read_text(encoding="utf-8", errors="replace")))
+
+    scripts_dir = skill_dir / "scripts"
+    if scripts_dir.exists():
+        for script_file in sorted(scripts_dir.rglob("*")):
+            if script_file.is_file() and script_file.suffix in (".py", ".sh", ".js", ".ts"):
+                blobs.append((str(script_file), script_file.read_text(encoding="utf-8", errors="replace")))
+
+    if not is_tableau_related(b[1] for b in blobs):
+        return {"applicable": False, "findings": [], "manual_checklist": []}
+
+    findings = []
+    all_text = "\n".join(b[1] for b in blobs)
+
+    # R2 -- a hardcoded Tableau MCP tool literal is only a problem if the skill has NO
+    # prefix-tolerant/pattern-matching language anywhere telling Claude how to resolve the tool
+    # when the actual session's prefix differs. One example literal next to that language is fine
+    # (that's how rule 9's general check already treats stable prefixes); a skill whose only
+    # instruction IS the bare literal is the failure mode R2 describes.
+    if not PREFIX_TOLERANT_LANGUAGE_PATTERN.search(all_text):
+        for file_path, text in blobs:
+            for m in TABLEAU_MCP_LITERAL_PATTERN.finditer(text):
+                findings.append({
+                    "id": f"tableau-r2-hardcoded-{Path(file_path).name}-{m.start()}",
+                    "confidence": "heuristic",
+                    "category": "tableau-r2",
+                    "file": file_path,
+                    "line": line_number_for(text, m.start()),
+                    "snippet": text[max(0, m.start() - 20):m.start() + len(m.group(0)) + 10].replace("\n", " ").strip(),
+                    "risk": f"Hardcodes the Tableau MCP tool name \"{m.group(0)}\" with no prefix-tolerant/pattern-matching language found anywhere in the skill (org rule R2). Exact MCP prefixes vary by session -- a skill whose only instruction is this bare literal fails to find the tool the moment the prefix differs.",
+                    "fix": "Describe the capability (e.g. \"query the Tableau datasource\") and tell Claude to pattern-match on the \"Tableau\" server name across whatever prefix resolves this session -- via ToolSearch in Cowork or the already-loaded MCP tool list in Claude Code -- rather than assuming this exact literal. See tableau-rules.md R2.",
+                })
+
+    # R4 -- non-standard credential env-var contract. If the skill reads some TABLEAU_* var(s)
+    # but not the standard PAT_NAME/PAT_VALUE pair, one setup no longer serves every Tableau
+    # skill the way R4 intends.
+    tableau_vars_seen = set(TABLEAU_ENV_VAR_PATTERN.findall(all_text))
+    if tableau_vars_seen and not TABLEAU_STANDARD_CREDENTIAL_VARS <= tableau_vars_seen:
+        missing = sorted(TABLEAU_STANDARD_CREDENTIAL_VARS - tableau_vars_seen)
+        nonstandard = sorted(tableau_vars_seen - TABLEAU_STANDARD_CREDENTIAL_VARS - TABLEAU_STANDARD_OPTIONAL_VARS)
+        findings.append({
+            "id": "tableau-r4-nonstandard-env-contract",
+            "confidence": "heuristic",
+            "category": "tableau-r4",
+            "file": str(skill_md_path),
+            "line": 1,
+            "snippet": f"TABLEAU_* vars found across the skill: {sorted(tableau_vars_seen)}",
+            "risk": (
+                f"Org rule R4 specifies a standard credential contract (TABLEAU_PAT_NAME + TABLEAU_PAT_VALUE "
+                f"required; TABLEAU_SERVER/TABLEAU_SITE optional) so one setup serves every Tableau skill. "
+                f"This skill is missing {missing}"
+                + (f" and uses non-standard var(s) {nonstandard}" if nonstandard else "")
+                + " -- a user who already set up credentials for another Tableau skill would need to set them up again, differently, for this one."
+            ),
+            "fix": "Rename to the standard contract (TABLEAU_PAT_NAME, TABLEAU_PAT_VALUE required; TABLEAU_SERVER, TABLEAU_SITE optional with sane defaults). See tableau-rules.md R4.",
+        })
+
+    # R4 -- secrets printed/logged
+    for file_path, text in blobs:
+        for m in TABLEAU_SECRET_LOG_PATTERN.finditer(text):
+            findings.append({
+                "id": f"tableau-r4-secret-logged-{Path(file_path).name}-{m.start()}",
+                "confidence": "heuristic",
+                "category": "tableau-r4",
+                "file": file_path,
+                "line": line_number_for(text, m.start()),
+                "snippet": text[max(0, m.start() - 10):m.start() + len(m.group(0)) + 20].replace("\n", " ").strip(),
+                "risk": "Looks like a token/secret value is being printed or logged (org rule R4: secrets are never printed, logged, echoed, or committed). Even a debug print can end up captured in a session transcript or CI log.",
+                "fix": "Remove the token/secret value from the print/log call -- log that a credential was used, or which var supplied it, never the value itself.",
+            })
+
+    # R5 -- mcporter / .venv references. Overlaps generically with compat-rules.md rule 5, but
+    # flagging it under the Tableau umbrella too keeps this checklist self-contained during the
+    # walkthrough rather than requiring a cross-reference back to the general findings.
+    for file_path, text in blobs:
+        for pat, label in ((MCPORTER_PATTERN, "mcporter"), (VENV_PATTERN, ".venv")):
+            for m in pat.finditer(text):
+                findings.append({
+                    "id": f"tableau-r5-{label}-{Path(file_path).name}-{m.start()}",
+                    "confidence": "heuristic",
+                    "category": "tableau-r5",
+                    "file": file_path,
+                    "line": line_number_for(text, m.start()),
+                    "snippet": text[max(0, m.start() - 20):m.start() + 20].replace("\n", " ").strip(),
+                    "risk": f"References \"{label}\" (org rule R5: no host-specific CLIs/configs, no virtualenv assumptions -- stdlib-only on a stock Python 3.9+). This assumes a specific machine setup that won't exist on every Claude Code user's machine or in Cowork's sandbox.",
+                    "fix": "Remove the assumption -- run on a stock Python 3.9+ interpreter with stdlib only, or explicitly declare and check any real dependency instead of assuming a particular local tool or virtualenv is present.",
+                })
+
+    # R3 -- authorization-flow language anywhere in the skill, with no "never trigger
+    # authorization" guardrail found anywhere in the skill either. Checked skill-wide rather than
+    # per-file, since the guardrail belongs wherever the model reads instructions mid-run, which
+    # may not be the same file that happens to mention the auth flow.
+    if not NO_AUTH_INSTRUCTION_PATTERN.search(all_text):
+        for file_path, text in blobs:
+            for m in AUTHORIZATION_FLOW_PATTERN.finditer(text):
+                findings.append({
+                    "id": f"tableau-r3-auth-flow-{Path(file_path).name}-{m.start()}",
+                    "confidence": "heuristic",
+                    "category": "tableau-r3",
+                    "file": file_path,
+                    "line": line_number_for(text, m.start()),
+                    "snippet": text[max(0, m.start() - 20):m.start() + len(m.group(0)) + 20].replace("\n", " ").strip(),
+                    "risk": "Mentions an authorization/elicitation flow, but no \"never trigger authorization\" guardrail was found anywhere in the skill (org rule R3). The configured connectors are already authorized -- a tool that demands new auth is by definition the wrong tool, and that needs to be stated explicitly so the model doesn't follow an auth link mid-run.",
+                    "fix": "Add an explicit instruction -- in both the operating instructions and any machine-readable artifact the model consumes mid-run (plans, query manifests, runbooks) -- that the skill must never initiate authorization to any MCP server/gateway/service. A tool demanding new auth is the wrong tool. See tableau-rules.md R3.",
+                })
+
+    return {"applicable": True, "findings": findings, "manual_checklist": TABLEAU_MANUAL_REVIEW_CHECKLIST}
+
 
 def parse_frontmatter(text):
     """Minimal, dependency-free frontmatter parser. Good enough for flat key: value pairs and
@@ -829,6 +1036,14 @@ def main():
     # credential wiring) rather than SKILL.md itself -- scan them with the same suppression.
     findings += scan_reference_docs(skill_dir, compat_text)
 
+    # Domain rule pack: only produces anything when the skill looks Tableau-related. Its
+    # mechanical findings get folded into the main findings list like everything else; the
+    # non-mechanical checklist (R1/R2-order/R6/R7) is surfaced separately since it isn't a
+    # finding at all -- it's a list of questions the calling skill still has to answer by reading
+    # the skill's real logic.
+    tableau_result = scan_tableau_rules(skill_dir, skill_md, skill_text)
+    findings += tableau_result["findings"]
+
     # also scan any bundled scripts for shell-injection-style patterns is out of scope --
     # scripts are executed, not preprocessed, so the injection/substitution rules don't apply
     # to them. Bundled scripts are still worth an env-var pass though.
@@ -931,6 +1146,10 @@ def main():
         "heuristic_count": sum(1 for f in findings if f["confidence"] == "heuristic"),
         "findings": findings,
         "verification": verification,
+        "tableau_domain_pack": {
+            "applicable": tableau_result["applicable"],
+            "manual_checklist": tableau_result["manual_checklist"],
+        },
     }
 
     if args.json:
@@ -945,6 +1164,11 @@ def main():
                 + (f" -- {verification['note']}" if verification.get("note") else "")
             )
         print(f"{result['finding_count']} finding(s): {result['confirmed_count']} confirmed, {result['heuristic_count']} heuristic\n")
+        if tableau_result["applicable"]:
+            print(
+                "Tableau domain rule pack activated (references/tableau-rules.md) -- "
+                f"{len(tableau_result['manual_checklist'])} item(s) need manual review beyond the findings below.\n"
+            )
         for f in findings:
             print(f"[{f['confidence'].upper()}] {f['category']} -- {f['file']}:{f['line']}")
             print(f"  {f['snippet']!r}")
