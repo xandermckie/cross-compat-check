@@ -21,8 +21,11 @@ calling skill should use to drive the interactive Q&A.
 """
 
 import argparse
+import ast
 import json
 import re
+import shutil
+import subprocess
 import sys
 from pathlib import Path
 
@@ -554,6 +557,244 @@ def scan_plugin_context(skill_dir: Path):
     return findings
 
 
+# --- Execution verification: actually run what can safely be run --------------------------
+#
+# Everything above is text pattern matching -- inferring risk from what a file *says*, never
+# confirming what actually happens when it runs. That's necessary (most cross-compat breaks are
+# about a platform not being present to run against), but it means a "heuristic" finding is
+# always a guess, never a reproduced fact. This section closes part of that gap: it actually
+# executes the two things that are both safe to run unconditionally and genuinely diagnostic --
+# real syntax parsing via each language's own checker (no side effects, nothing runs), and a
+# real `import <module>` attempt for third-party Python dependencies (standard, low-risk -- it's
+# what `pip check`-style tooling does, and it's bounded by a timeout in case a module does
+# something unexpected at import time). It deliberately does NOT run a script's actual business
+# logic -- that could hit live APIs, need real credentials, or have side effects, and deciding
+# to do that is a per-skill judgment call for the calling skill to make explicitly with the
+# user, not something this scanner does silently by default.
+
+STDLIB_MODULE_NAMES = getattr(sys, "stdlib_module_names", None) or {
+    "os", "sys", "re", "json", "argparse", "pathlib", "subprocess", "typing", "collections",
+    "itertools", "functools", "datetime", "time", "math", "random", "logging", "shutil",
+    "tempfile", "io", "csv", "sqlite3", "urllib", "http", "socket", "threading", "asyncio",
+    "dataclasses", "enum", "abc", "copy", "hashlib", "hmac", "base64", "struct", "textwrap",
+    "string", "unittest", "traceback", "warnings", "inspect", "importlib", "pickle", "queue",
+    "xml", "html", "email", "zipfile", "tarfile", "gzip", "configparser", "platform",
+}
+
+SYNTAX_CHECK_TIMEOUT = 10
+IMPORT_CHECK_TIMEOUT = 8
+
+
+def check_python_syntax(script_file: Path):
+    try:
+        proc = subprocess.run(
+            [sys.executable, "-m", "py_compile", str(script_file)],
+            capture_output=True, text=True, timeout=SYNTAX_CHECK_TIMEOUT,
+        )
+        return proc.returncode == 0, (proc.stderr.strip() or proc.stdout.strip())
+    except subprocess.TimeoutExpired:
+        return False, "py_compile timed out"
+    except Exception as e:  # pragma: no cover -- defensive, e.g. interpreter missing
+        return False, str(e)
+
+
+def check_shell_syntax(script_file: Path):
+    bash = shutil.which("bash")
+    if not bash:
+        return None, "bash not available in this environment to verify syntax"
+    try:
+        proc = subprocess.run(
+            [bash, "-n", str(script_file)],
+            capture_output=True, text=True, timeout=SYNTAX_CHECK_TIMEOUT,
+        )
+        return proc.returncode == 0, (proc.stderr.strip() or proc.stdout.strip())
+    except subprocess.TimeoutExpired:
+        return False, "bash -n timed out"
+    except Exception as e:  # pragma: no cover
+        return False, str(e)
+
+
+def check_js_syntax(script_file: Path):
+    node = shutil.which("node")
+    if not node:
+        return None, "node not available in this environment to verify syntax"
+    try:
+        proc = subprocess.run(
+            [node, "--check", str(script_file)],
+            capture_output=True, text=True, timeout=SYNTAX_CHECK_TIMEOUT,
+        )
+        return proc.returncode == 0, (proc.stderr.strip() or proc.stdout.strip())
+    except subprocess.TimeoutExpired:
+        return False, "node --check timed out"
+    except Exception as e:  # pragma: no cover
+        return False, str(e)
+
+
+class _ImportVisitor(ast.NodeVisitor):
+    """Collects top-level import module names, split into `unguarded` (module scope, or inside
+    any block that isn't a try's own body) and `guarded` (sitting inside a `try:` block's body,
+    specifically). That split matters: `try: import optional_pkg \\n except ImportError: ...` is
+    the standard, correct way to handle an optional dependency -- the author already accounted
+    for it possibly being missing. Treating that the same as an unconditional top-level import
+    would punish exactly the defensive pattern this tool should be encouraging elsewhere."""
+
+    def __init__(self):
+        self.unguarded = set()
+        self.guarded = set()
+        self._try_depth = 0
+
+    def visit_Try(self, node):
+        self._try_depth += 1
+        for stmt in node.body:
+            self.visit(stmt)
+        self._try_depth -= 1
+        for handler in node.handlers:
+            self.visit(handler)
+        for stmt in node.orelse:
+            self.visit(stmt)
+        for stmt in node.finalbody:
+            self.visit(stmt)
+
+    def visit_Import(self, node):
+        target = self.guarded if self._try_depth > 0 else self.unguarded
+        for alias in node.names:
+            target.add(alias.name.split(".")[0])
+
+    def visit_ImportFrom(self, node):
+        if node.level and node.level > 0:
+            return
+        if node.module:
+            target = self.guarded if self._try_depth > 0 else self.unguarded
+            target.add(node.module.split(".")[0])
+
+
+def collect_top_level_python_imports(script_text: str):
+    """Real imports parsed with ast (what the interpreter would actually try to load), not a
+    regex guess. Returns (unguarded, guarded) module-name sets; relative imports (from . import
+    x) are excluded from both since they're unambiguously local, not a dependency worth probing."""
+    try:
+        tree = ast.parse(script_text)
+    except SyntaxError:
+        return set(), set()
+    visitor = _ImportVisitor()
+    visitor.visit(tree)
+    # a name that shows up both guarded (in one try block) and unguarded (elsewhere) is treated
+    # as unguarded -- if there's an unconditional import anywhere, the try/except elsewhere
+    # doesn't actually protect the script from that path failing.
+    return visitor.unguarded, visitor.guarded - visitor.unguarded
+
+
+def verify_third_party_import(module_name: str):
+    try:
+        proc = subprocess.run(
+            [sys.executable, "-c", f"import {module_name}"],
+            capture_output=True, text=True, timeout=IMPORT_CHECK_TIMEOUT,
+        )
+        detail = proc.stderr.strip().splitlines()[-1] if proc.stderr.strip() else ""
+        return proc.returncode == 0, detail
+    except subprocess.TimeoutExpired:
+        return False, "import timed out (module may perform blocking/network work at import time)"
+    except Exception as e:  # pragma: no cover
+        return False, str(e)
+
+
+def run_execution_verification(skill_dir: Path):
+    """Returns (verification_summary, dynamic_findings). `verification_summary` is always
+    populated, including when there are zero scripts, so the calling skill can honestly report
+    what was actually checked rather than staying silent about verification never happening.
+    `dynamic_findings` contains only CONFIRMED, reproduced problems -- a real syntax error, a
+    real failed import -- never a guess."""
+    findings = []
+    scripts_dir = skill_dir / "scripts"
+    if not scripts_dir.exists():
+        return {
+            "scripts_checked": 0, "syntax_ok": 0, "syntax_failed": 0, "syntax_unverifiable": 0,
+            "imports_checked": [], "imports_failed": [], "imports_guarded": [],
+            "note": "no scripts/ directory -- nothing to execute-verify",
+        }, findings
+
+    script_files = sorted(p for p in scripts_dir.rglob("*") if p.is_file() and p.suffix in (".py", ".sh", ".js", ".ts"))
+    local_stems = {p.stem for p in script_files}
+
+    scripts_checked = syntax_ok = syntax_failed = syntax_unverifiable = 0
+    imports_checked, imports_failed, imports_guarded = [], [], []
+
+    for script_file in script_files:
+        scripts_checked += 1
+        script_text = script_file.read_text(encoding="utf-8", errors="replace")
+
+        if script_file.suffix == ".py":
+            ok, detail = check_python_syntax(script_file)
+            checker = "python3 -m py_compile"
+        elif script_file.suffix == ".sh":
+            ok, detail = check_shell_syntax(script_file)
+            checker = "bash -n"
+        else:
+            ok, detail = check_js_syntax(script_file)
+            checker = "node --check"
+
+        if ok is None:
+            syntax_unverifiable += 1
+        elif ok:
+            syntax_ok += 1
+        else:
+            syntax_failed += 1
+            findings.append({
+                "id": f"script-syntax-error-{script_file.name}",
+                "confidence": "confirmed",
+                "category": "execution",
+                "file": str(script_file),
+                "line": 1,
+                "snippet": detail[:200],
+                "risk": f"Actually ran this file through `{checker}` and it does NOT parse. This isn't a portability risk -- it's a bug that will fail identically on both products.",
+                "fix": "Fix the syntax error shown above before anything else; nothing about cross-compat matters if the script can't even parse.",
+            })
+
+        if script_file.suffix == ".py" and ok:
+            unguarded, guarded = collect_top_level_python_imports(script_text)
+
+            for module_name in sorted(guarded):
+                if module_name in STDLIB_MODULE_NAMES or module_name in local_stems or module_name.startswith("_"):
+                    continue
+                # Still probe it -- worth knowing for the summary -- but a try/except-guarded
+                # import is, by convention, the author already handling this exact failure mode.
+                # No finding either way: punishing the defensive pattern would be a false
+                # positive, and a plain pass isn't worth a finding.
+                passed, _ = verify_third_party_import(module_name)
+                imports_checked.append(module_name)
+                imports_guarded.append(module_name)
+                if not passed:
+                    imports_failed.append(module_name)
+
+            for module_name in sorted(unguarded):
+                if module_name in STDLIB_MODULE_NAMES or module_name in local_stems or module_name.startswith("_"):
+                    continue
+                passed, detail = verify_third_party_import(module_name)
+                imports_checked.append(module_name)
+                if not passed:
+                    imports_failed.append(module_name)
+                    findings.append({
+                        "id": f"script-import-unavailable-{script_file.name}-{module_name}",
+                        "confidence": "confirmed",
+                        "category": "execution",
+                        "file": str(script_file),
+                        "line": 1,
+                        "snippet": f"import {module_name}",
+                        "risk": f"Actually ran `python3 -c \"import {module_name}\"` in this scanning environment and it failed: {detail or 'ModuleNotFoundError'}. If it's not importable here, it's not a safe bet it's preinstalled in Cowork's sandbox or on every Claude Code user's machine either.",
+                        "fix": f"Vendor a stdlib-only replacement, or explicitly document `{module_name}` as a required pip dependency the user must install -- and confirm that's actually realistic on both products before relying on it.",
+                    })
+
+    return {
+        "scripts_checked": scripts_checked,
+        "syntax_ok": syntax_ok,
+        "syntax_failed": syntax_failed,
+        "syntax_unverifiable": syntax_unverifiable,
+        "imports_checked": imports_checked,
+        "imports_failed": imports_failed,
+        "imports_guarded": imports_guarded,
+    }, findings
+
+
 def find_skill_md(target: Path) -> Path:
     if target.is_file() and target.name == "SKILL.md":
         return target
@@ -567,6 +808,7 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("target", help="Path to a skill directory or its SKILL.md")
     parser.add_argument("--json", action="store_true", help="Emit structured JSON instead of a human-readable report")
+    parser.add_argument("--no-execute", action="store_true", help="Skip the execution-verification pass (real syntax/import checks) and only run the static text scan")
     args = parser.parse_args()
 
     target = Path(args.target).expanduser().resolve()
@@ -662,18 +904,46 @@ def main():
                     "fix": "Read a .env-style file with a small stdlib-only parser instead (split each line on the first \"=\", strip quotes/whitespace, skip blank/# lines). See compat-rules.md rule 10 for the pattern.",
                 })
 
+    if args.no_execute:
+        verification = {
+            "scripts_checked": 0, "syntax_ok": 0, "syntax_failed": 0, "syntax_unverifiable": 0,
+            "imports_checked": [], "imports_failed": [], "imports_guarded": [],
+            "note": "--no-execute passed -- execution verification was skipped; the findings below are text-pattern inference only, not reproduced.",
+        }
+    else:
+        verification, exec_findings = run_execution_verification(skill_dir)
+        findings += exec_findings
+        # Real evidence beats a guess: if a script imports something we already flagged
+        # heuristically (dotenv is the only one right now) and the import actually succeeded in
+        # THIS environment, say so on the existing finding rather than leaving it as an
+        # unqualified guess -- still not proof it's available on Cowork or the end user's
+        # machine, but "confirmed importable here, unverified elsewhere" is a strictly more
+        # honest statement than silence.
+        if "dotenv" in verification["imports_checked"] and "dotenv" not in verification["imports_failed"]:
+            for f in findings:
+                if f["id"].startswith("dotenv-dependency") or f["id"].startswith("script-dotenv-dependency"):
+                    f["risk"] += " (Actually checked: python-dotenv imports successfully in this scanning environment -- that does NOT confirm it's present in Cowork's sandbox or on the end user's machine, which is a different Python install entirely.)"
+
     result = {
         "skill_md": str(skill_md),
         "finding_count": len(findings),
         "confirmed_count": sum(1 for f in findings if f["confidence"] == "confirmed"),
         "heuristic_count": sum(1 for f in findings if f["confidence"] == "heuristic"),
         "findings": findings,
+        "verification": verification,
     }
 
     if args.json:
         print(json.dumps(result, indent=2))
     else:
         print(f"Scanned {skill_md}")
+        if verification.get("scripts_checked", 0) or verification.get("note"):
+            print(
+                f"Execution check: {verification.get('scripts_checked', 0)} script(s) checked, "
+                f"{verification.get('syntax_ok', 0)} syntax-ok, {verification.get('syntax_failed', 0)} syntax-failed, "
+                f"{len(verification.get('imports_checked', []))} import(s) probed, {len(verification.get('imports_failed', []))} failed"
+                + (f" -- {verification['note']}" if verification.get("note") else "")
+            )
         print(f"{result['finding_count']} finding(s): {result['confirmed_count']} confirmed, {result['heuristic_count']} heuristic\n")
         for f in findings:
             print(f"[{f['confidence'].upper()}] {f['category']} -- {f['file']}:{f['line']}")

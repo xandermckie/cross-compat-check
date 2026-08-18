@@ -238,6 +238,56 @@ a `skills/` directory with siblings like `agents/`, `hooks/`, `.mcp.json`):
   `description`, `author`, `homepage`, `repository`, `license`, `keywords`, plus the optional
   `commands`/`agents`/`hooks`/`mcpServers` path overrides).
 
+## 11. Execution verification -- actually running what's safe to run (Confirmed, when triggered)
+
+Rules 1-10 are all text pattern matching: inferring risk from what a file *says*, never
+confirming what actually happens when it runs. That's necessary for most cross-compat checks
+(the whole point is comparing behavior across a platform the scanner isn't running on), but it
+means every "heuristic" finding is a guess dressed up as a warning -- not a reproduced fact.
+
+The scanner closes part of that gap itself, automatically, every run (no flag needed unless you
+pass `--no-execute`): it actually runs each bundled script through its own language's real
+syntax checker (`python3 -m py_compile`, `bash -n`, `node --check` -- pure parsing, nothing
+executes), and actually attempts `python3 -c "import <module>"` for every third-party import a
+Python script makes at module scope. Both are safe to run unconditionally: a syntax check never
+executes the file's logic, and importing a module is standard, low-risk practice (bounded by a
+timeout in case something does unexpected work at import time) -- it's what `pip check`-style
+tooling already does. This deliberately stops there. It does NOT run a script's actual business
+logic -- that could hit live APIs, need real credentials, or have side effects, and choosing to
+do that is a per-skill judgment call the calling skill should make explicitly with the user, not
+something to do silently by default.
+
+**A syntax error or a genuinely missing import is a `confirmed` finding, not a heuristic** --
+it's a reproduced fact, not an inference, and it's not really a cross-compat issue at all: a
+script that can't parse or can't import its own dependencies fails identically on both products.
+Report these first, before anything else, since nothing about portability matters until the
+script actually runs.
+
+**Imports guarded by `try: import X / except ImportError:` are never flagged**, even if the
+import fails in the scanner's own environment. That pattern means the author already decided the
+dependency is optional and wrote a fallback -- catching that as a "confirmed" problem would
+punish exactly the defensive coding this tool should want to see more of. The scanner still
+probes guarded imports (so the verification summary can honestly say what was checked), it just
+doesn't turn a guarded failure into a finding. This is exactly the shape of a good pattern found
+in the wild: a skill's `us_holidays()` helper tries `import holidays`, falls back to a small
+vendored federal-holiday table on `ImportError`, and documents in its own docstring that holiday
+exclusion "NEVER silently degrades" as a result -- that's the model to point to when explaining
+why this distinction matters, not just describing it abstractly.
+
+**A successful import only proves availability in the scanner's own environment.** If a script
+imports `python-dotenv` and the scanner's `import dotenv` actually succeeds, say exactly that --
+and immediately caveat it: this scanning environment having the package installed says nothing
+about whether Cowork's sandbox or the end user's Claude Code machine does. Don't let a passing
+check read as "confirmed fine everywhere"; the honest claim is narrower than that.
+
+**Always report the verification summary to the user, not just the findings it produced.** The
+scanner returns a top-level `verification` object (`scripts_checked`, `syntax_ok`,
+`syntax_failed`, `imports_checked`, `imports_failed`, `imports_guarded`) every run, even when
+there's nothing to check (`scripts_checked: 0` with a `note` explaining why). Surfacing this --
+"actually ran N scripts through a real syntax check and tried importing M third-party
+dependencies; here's what passed" -- is what makes this check something you *ran*, not something
+you *assumed*, and the user should see that distinction, not just the list of problems found.
+
 ## 9. Hardcoded MCP server/tool names (Heuristic)
 
 MCP tools show up in the toolset as `mcp__<server>__<tool>`, and it's tempting to write a skill

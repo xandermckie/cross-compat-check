@@ -56,8 +56,19 @@ reference doc tells you *why it matters* and gives you the fuller fix pattern to
 scanner's `fix` field is a short version; the doc has the reasoning and, for tool-reference
 findings, the general "check-and-fallback" rewrite pattern worth teaching, not just applying).
 
-If the scan comes back with zero findings, say so plainly and skip straight to Step 4 -- don't
-manufacture things to ask about.
+The JSON also includes a top-level `verification` object -- the scanner doesn't just pattern-match
+text, it actually runs each bundled script through a real syntax checker and actually attempts to
+import every third-party Python dependency (see compat-rules.md rule 11 for exactly what that
+does and doesn't cover). **Always report this to the user before the findings list**, even when
+it found nothing wrong -- e.g. "actually ran 5 scripts through a syntax check and tried importing
+2 third-party dependencies; all passed" is the evidence that this was actually verified, not
+assumed, and the user should see that regardless of whether problems turned up. Any
+`category: execution` findings (a real syntax error, a real failed import) are `confirmed` --
+present these before every other finding, since nothing about cross-compat matters if the script
+doesn't even run.
+
+If the scan comes back with zero findings, say so plainly (including the verification summary)
+and skip straight to Step 4 -- don't manufacture things to ask about.
 
 ## Step 3: Walk through findings one at a time (grill-me style)
 
@@ -72,7 +83,14 @@ For each finding:
 2. **Explain the risk in plain terms** -- what actually happens differently on the other
    product, not just "this field isn't allowed." If you know *why* (from compat-rules.md), say
    why -- that's the teaching part of this skill, and it's what makes the user better at writing
-   portable skills next time instead of just fixing this one.
+   portable skills next time instead of just fixing this one. For an `mcp-reference` finding
+   (rule 9) specifically, don't just assert the risk -- actually check it: run `ToolSearch` (or,
+   in Claude Code, look at your already-loaded tool list) for the exact hardcoded name right now,
+   in this session, and tell the user whether it resolves here or not. Either answer is useful
+   evidence ("it doesn't resolve in this session either" makes the risk concrete; "it does
+   resolve here" is still worth saying, with the caveat that a different session/user/org may
+   have it under a different name) -- but don't skip the check and just describe the theoretical
+   risk when you have the tools to verify it directly.
 3. **Propose a specific fix** -- not "consider rewriting this," but the actual replacement text
    or frontmatter change you'd make. For tool-reference findings, default to proposing the
    check-and-fallback rewrite pattern (see compat-rules.md rule 4) rather than just deleting the
@@ -153,3 +171,12 @@ reasonable to tell the user the skill is ready to check into GitHub -- don't say
   Cowork-only or Claude-Code-only, say that uncertainty out loud rather than asserting it as
   fact -- and if you learn a tool's availability has changed, that's worth updating both the
   list and that date in `compat-rules.md` for next time.
+- Rules 1-10 are text pattern matching -- inference, not proof. Rule 11 is the exception: every
+  run, the scanner actually parses each bundled script with its real language checker and
+  actually attempts every third-party Python import, so a syntax error or a missing dependency
+  in the findings list is a reproduced fact, not a guess (that's why those land as `confirmed`).
+  An import sitting inside `try: ... except ImportError:` is deliberately never flagged even if
+  it fails here -- that's the author already handling an optional dependency correctly, and
+  punishing it would be a false positive. A passing import check only proves the package is
+  importable in *this* scanning environment, not in Cowork's sandbox or the end user's Claude
+  Code install -- say that caveat out loud rather than implying the check guarantees portability.
